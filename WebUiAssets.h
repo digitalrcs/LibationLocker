@@ -209,10 +209,10 @@ static const char LL_INDEX_HTML[] PROGMEM = R"LL(
     .btn{ padding:10px 12px; border-radius:14px; }
     dialog{ width:min(560px,96vw); }
 
-    /* Switch schedule view: cards instead of table */
-    .tablewrap{ display:none; }
-    .cards{ display:block; }
-    table{ display:none; }
+    /* On phones: keep the inventory grid visible and horizontally scrollable.
+       (If you later add a schedule pane with cards, scope that behavior to that pane.) */
+    #paneInv .tablewrap{ display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+    #paneInv table{ display:table; }
 
     /* Make top buttons easier */
     .iconbtn{ width:42px; height:42px; border-radius:14px; }
@@ -253,9 +253,17 @@ table{ width:100%; border-collapse:collapse; }
 th,td{ padding:10px 10px; border-bottom:1px solid rgba(255,255,255,.10); text-align:left; white-space:nowrap; }
 th{ color:var(--muted); font-weight:900; }
 tr:hover td{ background:rgba(255,255,255,.04); }
-.modalBackdrop{ position:fixed; inset:0; background:rgba(0,0,0,.78); display:none; align-items:center; justify-content:center; padding:16px; }
+.modalBackdrop{ position:fixed; inset:0; background:rgba(0,0,0,.78); display:none; align-items:center; justify-content:center; padding:16px; overflow-y:auto; }
 .modalBackdrop.show{ display:flex; }
-.modal{ width:min(720px, 100%); }
+@media (max-width: 720px){ .modalBackdrop{ align-items:flex-start; } }
+.modal{ width:min(720px, 100%); 
+  /* Mobile: allow scrolling inside the modal so the Save button is reachable */
+  max-height:calc(100vh - 32px);
+  max-height:calc(100dvh - 32px);
+  overflow-y:auto;
+  overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;
+}
 .card.modal{ flex:0 0 auto; }
   .card.modal{ background:rgba(7,26,51,.96); border:1px solid rgba(255,255,255,.20); }
 
@@ -334,7 +342,7 @@ tr:hover td{ background:rgba(255,255,255,.04); }
         <table id="tbl">
           <thead>
             <tr>
-              <th>Type</th><th>Brand</th><th>Name</th><th>Size</th><th>ABV</th><th>Qty</th>
+              <th></th><th>Type</th><th>Brand</th><th>Name</th><th>Size</th><th>ABV</th><th>Qty</th>
               <th>Remain%</th><th>Need</th><th>Rating</th><th>Tags</th><th></th>
             </tr>
           </thead>
@@ -466,7 +474,34 @@ tr:hover td{ background:rgba(255,255,255,.04); }
   </div>
 </div>
 
+<div class="modalBackdrop" id="viewBg">
+  <div class="card modal">
+    <div class="title" style="font-size:18px;" id="viewTitle">View Item</div>
+    <div style="height:12px"></div>
+
+    <div class="kv" style="grid-template-columns:140px 1fr; gap:8px 12px;">
+      <div class="k">Type</div><div id="vType"></div>
+      <div class="k">Brand</div><div id="vBrand"></div>
+      <div class="k">Name</div><div id="vName"></div>
+      <div class="k">Size (mL)</div><div id="vSize"></div>
+      <div class="k">ABV</div><div id="vAbv"></div>
+      <div class="k">Qty</div><div id="vQty"></div>
+      <div class="k">Remaining %</div><div id="vRemain"></div>
+      <div class="k">Need to buy</div><div id="vNeed"></div>
+      <div class="k">Rating</div><div id="vRating"></div>
+      <div class="k">Tags</div><div id="vTags"></div>
+      <div class="k">Notes</div><div id="vNotes" style="white-space:pre-wrap; word-break:break-word;"></div>
+    </div>
+
+    <div style="height:12px"></div>
+    <div class="row" style="justify-content:flex-end;">
+      <button class="btn primary" id="btnViewClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
+
 'use strict';
 
 const $ = (id)=>document.getElementById(id);
@@ -556,6 +591,7 @@ function render(){
     const tr=document.createElement('tr');
     const tags = (it.tags||[]).join(', ');
     tr.innerHTML = `
+      <td><button class=\"btn\" data-act=\"view\" data-id=\"${esc(it.id)}\">View</button></td>
       <td>${esc(it.type||'')}</td>
       <td>${esc(it.brand||'')}</td>
       <td>${esc(it.name||'')}</td>
@@ -579,6 +615,7 @@ function render(){
     if(!b) return;
     const id = b.getAttribute('data-id');
     const act = b.getAttribute('data-act');
+    if(act==='view') openView(id);
     if(act==='edit') openModal(id);
     if(act==='del') {
       if(!confirm('Delete this item?')) return;
@@ -625,6 +662,26 @@ function openModal(id=null){
 }
 
 function closeModal(){ $('modalBg').classList.remove('show'); }
+
+function openView(id){
+  const it = items.find(x => String(x.id) === String(id));
+  if(!it){ toast('Item not found'); return; }
+  $('viewTitle').textContent = 'View Item';
+  $('vType').textContent = it.type || '';
+  $('vBrand').textContent = it.brand || '';
+  $('vName').textContent = it.name || '';
+  $('vSize').textContent = String(it.sizeMl ?? '');
+  $('vAbv').textContent = (it.abv ?? '') === null ? '' : String(it.abv ?? '');
+  $('vQty').textContent = String(it.qty ?? 0);
+  $('vRemain').textContent = String(it.remainingPct ?? '');
+  $('vNeed').textContent = it.needToBuy ? 'Yes' : 'No';
+  $('vRating').textContent = String(it.rating ?? 0);
+  $('vTags').textContent = (it.tags||[]).join(', ');
+  $('vNotes').textContent = it.notes || '';
+  $('viewBg').classList.add('show');
+}
+function closeView(){ $('viewBg').classList.remove('show'); }
+
 
 async function saveModal(){
   const btn = $('btnSaveItem');
@@ -768,6 +825,8 @@ function wire(){
   $('btnCancel').onclick = closeModal;
   $('modalBg').onclick = (e)=>{ if(e.target === $('modalBg')) closeModal(); };
   $('btnSaveItem').onclick = saveModal;
+  $('btnViewClose').onclick = closeView;
+  $('viewBg').onclick = (e)=>{ if(e.target === $('viewBg')) closeView(); };
 
   $('btnSaveCfg').onclick = saveConfig;
 

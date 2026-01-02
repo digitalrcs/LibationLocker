@@ -6,8 +6,8 @@ LibationLocker is a **local, self-hosted inventory web app** for tracking spirit
 - persistence via **LittleFS** (inventory + dropdown config)
 
 ## Features
-- **AP-first** operation (device always creates its own Wi-Fi AP)
-- Optional **STA join** to your home Wi-Fi (AP+STA)
+- **AP-first** operation (device always creates its own Wi‑Fi AP)
+- Optional **STA join** to your home Wi‑Fi (AP+STA)
 - mDNS: browse to **`http://libationlocker.local/`** when connected to your LAN
 - Inventory CRUD (type/brand/name/size/ABV/qty/remaining/need/rating/tags/notes)
 - Import/Export (JSON/CSV/TXT)
@@ -21,7 +21,7 @@ LibationLocker is a **local, self-hosted inventory web app** for tracking spirit
 ## Hardware / Build Notes
 
 ### Recommended boards
-- ESP32-S3 with PSRAM (ex: **N16R8 = 16MB flash / 8MB PSRAM**)
+- ESP32‑S3 with PSRAM (ex: **N16R8 = 16MB flash / 8MB PSRAM**)
 
 ### Arduino IDE settings (typical)
 - Board: **ESP32S3 Dev Module**
@@ -357,7 +357,7 @@ Minimal valid `libationlocker-export.json` (config + items) you can import via `
       "needToBuy": true,
       "rating": 4,
       "tags": ["daily", "cocktails"],
-      "notes": "Good all-rounder.",
+      "notes": "Good all‑rounder.",
       "updatedAt": 1700000000,
       "version": 1
     }
@@ -393,8 +393,8 @@ Symptoms:
 - UI: `Import failed: LittleFS mount failed...`
 
 Fix:
-- Ensure your partition table includes a filesystem partition labeled **`spiffs`** with subtype **littlefs** (this repo's `partitions.csv` does).
-- Verify Arduino IDE **Flash Size = 16MB** (for ESP32-S3 N16R8).
+- Ensure your partition table includes a filesystem partition labeled **`spiffs`** with subtype **littlefs** (this repo’s `partitions.csv` does).
+- Verify Arduino IDE **Flash Size = 16MB** (for ESP32‑S3 N16R8).
 - Do a one-time **Tools → Erase Flash → All Flash Contents** after changing partitions.
 - Hit `GET /api/fs` to verify files exist under `/data/`.
 
@@ -406,11 +406,11 @@ Use the current firmware (it returns `totalBytes/usedBytes/freeBytes`).
 That means RAM updated but persistence failed.  
 Use `GET /api/fs` to confirm `/data/inventory.json` exists and grows after import.
 
-### `libationlocker.local` doesn't resolve
+### `libationlocker.local` doesn’t resolve
 - Windows: install Bonjour / iTunes (mDNS responder), or use the IP shown in Serial.
 - Some guest/VLAN networks block multicast DNS; try same LAN segment.
 
-### Can't upload / wrong boot mode
+### Can’t upload / wrong boot mode
 - Hold **BOOT** while tapping **RESET**, then upload.
 - If using a USB hub/cable, try a known-good data cable and direct port.
 

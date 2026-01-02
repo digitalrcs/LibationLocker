@@ -16,7 +16,7 @@ RuntimeConfig AppConfig::_cfg;
 
 void AppConfig::begin() {
   _cfg = RuntimeConfig();
-  _cfg.apSsid = "LibationLocker";
+  _cfg.apSsid = "LibationLockerTest";
   _cfg.apPass = "";
 }
 
