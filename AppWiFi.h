@@ -34,11 +34,15 @@ public:
   static IPAddress staIP();
   static int staRssi();
 
+  // NTP time sync (available when STA is connected)
+  static bool ntpSynced();
+  static uint32_t epochNow();   // returns epoch seconds, or 0 if not synced
+
   // Config (persisted in NVS)
   static StaConfig getStaConfig();
-  static bool setStaConfig(const StaConfig& cfg);
 
-  // Force reconnect attempt (non-blocking)
+  // Safe to call from any task (async handler, etc.) — deferred to loop()
+  static bool setStaConfig(const StaConfig& cfg);
   static void reconnect();
 
 private:
@@ -47,9 +51,16 @@ private:
   static void startAp_();
   static void startSta_();
   static void startMdns_();
+  static void applyReconfig_();
+  static void startNtp_();
 
-  static bool _mdnsStarted;
+  static bool         _mdnsStarted;
+  static bool         _ntpSynced;
+  static bool         _wasStaConnected;   // edge detection for STA connect
+  static StaConfig    _cfg;
+  static uint32_t     _lastAttemptMs;
 
-  static StaConfig _cfg;
-  static uint32_t _lastAttemptMs;
+  // Set by setStaConfig()/reconnect() from any task; consumed by loop() in main task.
+  // volatile ensures the compiler does not cache the value in a register across tasks.
+  static volatile bool _pendingReconfig;
 };

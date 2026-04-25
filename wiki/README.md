@@ -1,12 +1,36 @@
-# Libation Locker Wiki (copy to GitHub Wiki)
+# Wiki source
 
-GitHub Wiki is stored in a separate repository (the `*.wiki.git` repo).  
-This folder contains pre-written pages you can copy/paste into your GitHub Wiki.
+These markdown files mirror what the GitHub Wiki should contain. GitHub Wiki is a separate Git repo; you can either:
 
-## How to use
-1. In GitHub, enable **Wiki** for your repository.
-2. Create a page with the same name as the file (without `.md`), e.g. `Home`, `API`, `Installation`.
-3. Copy the content of each markdown file into the GitHub Wiki editor.
-4. (Optional) Add `_Sidebar.md` and `_Footer.md` for navigation.
+## Option A — Paste into the GitHub Web UI
 
-Tip: GitHub Wiki uses the `[[Page Name]]` link style used in these pages.
+1. On your repo: **Wiki** tab → **Create the first page**.
+2. For each `.md` file in this folder, create a new page with the same name (without `.md`) and paste the contents.
+3. Page name to filename mapping:
+   - `Home` → `Home.md`
+   - `Installation` → `Installation.md`
+   - `API` → `API.md`
+   - `Architecture` → `Architecture.md`
+   - `AI Assistant` → `AI-Assistant.md` (GitHub renders the dash as a space)
+   - `Troubleshooting` → `Troubleshooting.md`
+   - `Development` → `Development.md`
+
+## Option B — Git push (faster for updates)
+
+GitHub Wiki has its own clone URL: `https://github.com/<user>/<repo>.wiki.git`.
+
+```bash
+git clone https://github.com/<user>/LibationLocker.wiki.git
+cd LibationLocker.wiki
+cp ../LibationLocker/wiki/*.md .
+git add .
+git commit -m "Sync wiki with code (AI assistant docs)"
+git push
+```
+
+## Notes
+
+- GitHub Wiki uses the **filename** (without `.md`) as the page title and URL slug.
+- Spaces in titles are dashes in the URL (`AI Assistant` → `AI-Assistant`).
+- Internal links between pages use the dashed form: `[AI Assistant](AI-Assistant)`.
+- Don't rename `Home.md` — GitHub Wiki uses it as the landing page.

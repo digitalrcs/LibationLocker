@@ -11,22 +11,153 @@
  */
 
 #include "InventoryStore.h"
+#include "PsramAllocator.h"
 #include "AppConfig.h"
+#include "AppWiFi.h"
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <LittleFS.h>
 #include <functional>
+#include "freertos/semphr.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
+#include <esp_task_wdt.h>
+#include "AppSerial.h"
 
-// Forward-declare so we can use it before the definition.
-static void withLock(SemaphoreHandle_t lock, std::function<void()> fn);
+// ---------------------------------------------------------------------------
+// Static member definitions
+// ---------------------------------------------------------------------------
 
-std::vector<Item> InventoryStore::_items;
-DropdownConfig InventoryStore::_cfg;
-SemaphoreHandle_t InventoryStore::_lock = nullptr;
-String InventoryStore::_lastError;
+ItemVector             InventoryStore::_items;
+DropdownConfig         InventoryStore::_cfg;
+SemaphoreHandle_t      InventoryStore::_lock = nullptr;
+String                 InventoryStore::_lastError;
 
-static bool s_fsReady = false;
+static bool               s_fsReady = false;
+static EventGroupHandle_t s_saveEvents = nullptr;
+static TaskHandle_t       s_saveTaskHandle = nullptr;
 
+static constexpr EventBits_t EVT_INV_DIRTY = 1 << 0;
+static constexpr EventBits_t EVT_CFG_DIRTY = 1 << 1;
+
+// Rough per-item JSON size for buffer estimation.
+// Covers: id(10) + type(15) + brand(25) + name(30) + sizeMl(5) + abv(5)
+//         + qty(3) + remainingPct(3) + needToBuy(5) + rating(2) + tags(40)
+//         + notes(80) + updatedAt(12) + version(3) + keys/punctuation(~120)
+// Total ~360 bytes. Use 512 to leave headroom for long notes/tags.
+static constexpr size_t EST_BYTES_PER_ITEM = 512;
+
+// ---------------------------------------------------------------------------
+// Lock helpers
+// ---------------------------------------------------------------------------
+
+static void withLock(SemaphoreHandle_t lock, std::function<void()> fn) {
+  if (!lock) { fn(); return; }
+  if (xSemaphoreTakeRecursive(lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    fn();
+    xSemaphoreGiveRecursive(lock);
+  } else {
+    APP_SERIAL.println("[INV] Lock timeout (2000 ms)");
+  }
+}
+
+static bool withLockBool(SemaphoreHandle_t lock, std::function<bool()> fn) {
+  if (!lock) return fn();
+  if (xSemaphoreTakeRecursive(lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
+    bool ok = fn();
+    xSemaphoreGiveRecursive(lock);
+    return ok;
+  }
+  APP_SERIAL.println("[INV] Lock timeout (2000 ms)");
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Background saver task
+// ---------------------------------------------------------------------------
+
+void InventoryStore::inventorySaveTask(void* arg) {
+  for (;;) {
+    EventBits_t bits = xEventGroupWaitBits(s_saveEvents,
+                                           EVT_INV_DIRTY | EVT_CFG_DIRTY,
+                                           pdTRUE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+
+    // Debounce: wait 800ms so rapid edits coalesce into one write
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    // Track which saves succeed so we can re-mark failures
+    bool cfgOk = true, invOk = true;
+
+    if (xSemaphoreTakeRecursive(_lock, pdMS_TO_TICKS(3000)) == pdTRUE) {
+      if (bits & EVT_CFG_DIRTY) {
+        cfgOk = _saveConfig();
+        if (!cfgOk) APP_SERIAL.println("[INV] Config save FAILED — will retry");
+      }
+      if (bits & EVT_INV_DIRTY) {
+        invOk = _saveInventory();
+        if (!invOk) APP_SERIAL.println("[INV] Inventory save FAILED — will retry");
+      }
+      xSemaphoreGiveRecursive(_lock);
+    } else {
+      APP_SERIAL.println("[INV] Save task lock timeout (3000 ms) — will retry");
+      cfgOk = false;
+      invOk = false;
+    }
+
+    // Re-set dirty bits for anything that failed so it retries next cycle
+    EventBits_t retry = 0;
+    if (!cfgOk && (bits & EVT_CFG_DIRTY)) retry |= EVT_CFG_DIRTY;
+    if (!invOk && (bits & EVT_INV_DIRTY)) retry |= EVT_INV_DIRTY;
+    if (retry) xEventGroupSetBits(s_saveEvents, retry);
+  }
+}
+
+static void ensureSaveTaskStarted() {
+  if (!s_saveEvents) s_saveEvents = xEventGroupCreate();
+  if (!s_saveTaskHandle) {
+    xTaskCreatePinnedToCore(
+      InventoryStore::inventorySaveTask,
+      "inv_save",
+      12288,    // was 9216 — increased for LittleFS + JSON overhead safety
+      nullptr,
+      1,
+      &s_saveTaskHandle,
+      1
+    );
+  }
+}
+
+static void markDirty(EventBits_t bits) {
+  ensureSaveTaskStarted();
+  xEventGroupSetBits(s_saveEvents, bits);
+}
+
+// ---------------------------------------------------------------------------
+// begin()
+// ---------------------------------------------------------------------------
+
+void InventoryStore::begin() {
+  if (!_lock) _lock = xSemaphoreCreateRecursiveMutex();
+  ensureSaveTaskStarted();
+
+  if (!_ensureFs()) {
+    APP_SERIAL.println("[INV] LittleFS mount failed - RAM only");
+  }
+
+  _seedDefaultsIfMissing();
+  _loadConfig();
+  _loadInventory();
+
+  APP_SERIAL.printf("[INV] Startup config: types=%u sizes=%u abv=%u rem=%u\n",
+                    _cfg.types.size(), _cfg.sizesMl.size(),
+                    _cfg.abvPresets.size(), _cfg.remainingPresets.size());
+  APP_SERIAL.printf("[INV] Loaded %u items (capacity=%u, PSRAM-backed)\n",
+                    _items.size(), _items.capacity());
+  APP_SERIAL.printf("[INV] Free heap: %u  PSRAM free: %u\n",
+                    ESP.getFreeHeap(), ESP.getFreePsram());
+}
 
 String InventoryStore::lastError() {
   String e;
@@ -34,98 +165,103 @@ String InventoryStore::lastError() {
   return e;
 }
 
-static void withLock(SemaphoreHandle_t lock, std::function<void()> fn) {
-  if (!lock) { fn(); return; }
-  if (xSemaphoreTake(lock, pdMS_TO_TICKS(2000)) == pdTRUE) {
-    fn();
-    xSemaphoreGive(lock);
-  } else {
-    // If lock can't be acquired, still run to avoid deadlock loops; MVP.
-    fn();
-  }
-}
-
-void InventoryStore::begin() {
-  if (!_lock) _lock = xSemaphoreCreateMutex();
-  _seedDefaultsIfMissing();
-  _loadConfig();
-  _loadInventory();
-}
+// ---------------------------------------------------------------------------
+// Read access
+// ---------------------------------------------------------------------------
 
 std::vector<Item> InventoryStore::getAll() {
   std::vector<Item> copy;
-  withLock(_lock, [&](){ copy = _items; });
+  withLock(_lock, [&](){
+    copy.reserve(_items.size());
+    for (const auto& it : _items) copy.push_back(it);
+  });
   return copy;
 }
 
-bool InventoryStore::getById(const String& id, Item& out) {
-  bool ok=false;
-  withLock(_lock, [&](){
-    for (auto& it : _items) {
-      if (it.id == id) { out = it; ok = true; return; }
+size_t InventoryStore::count() {
+  size_t n = 0;
+  withLock(_lock, [&](){ n = _items.size(); });
+  return n;
+}
+
+void InventoryStore::forEach(std::function<bool(const Item&)> cb) {
+  withLock(_lock, [&]() {
+    for (const auto& it : _items) {
+      if (!cb(it)) break;
     }
   });
-  return ok;
 }
+
+bool InventoryStore::getById(const String& id, Item& out) {
+  return withLockBool(_lock, [&]() -> bool {
+    for (const auto& it : _items) {
+      if (it.id == id) { out = it; return true; }
+    }
+    return false;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Write access
+// ---------------------------------------------------------------------------
 
 bool InventoryStore::create(const Item& in, Item& outCreated) {
-  bool ok=false;
-  withLock(_lock, [&](){
+  bool ok = withLockBool(_lock, [&]() -> bool {
     Item x = in;
-    x.id = _genId();
-    x.version = 1;
+    if (x.id.isEmpty()) x.id = _genId();
     x.updatedAt = _now();
+    x.version = 1;
     _items.push_back(x);
-    ok = _saveInventory();
     outCreated = x;
+    return true;
   });
+  if (ok) markDirty(EVT_INV_DIRTY);
   return ok;
 }
 
-bool InventoryStore::update(const String& id, const Item& in, Item& outUpdated, bool& versionConflict, Item& current) {
-  bool ok=false;
+bool InventoryStore::update(const String& id, const Item& in, Item& outUpdated,
+                            bool& versionConflict, Item& current) {
   versionConflict = false;
-  withLock(_lock, [&](){
+  bool ok = withLockBool(_lock, [&]() -> bool {
     for (auto& it : _items) {
       if (it.id == id) {
         current = it;
-        // optimistic concurrency
         if (in.version != 0 && in.version != it.version) {
           versionConflict = true;
-          ok = false;
-          return;
+          return false;
         }
-
         Item x = in;
         x.id = id;
         x.version = it.version + 1;
         x.updatedAt = _now();
         it = x;
-
-        ok = _saveInventory();
-        outUpdated = it;
-        return;
+        outUpdated = x;
+        return true;
       }
     }
-    ok = false;
+    return false;
   });
+  if (ok) markDirty(EVT_INV_DIRTY);
   return ok;
 }
 
 bool InventoryStore::remove(const String& id) {
-  bool ok=false;
-  withLock(_lock, [&](){
-    for (size_t i=0;i<_items.size();++i) {
-      if (_items[i].id == id) {
-        _items.erase(_items.begin()+i);
-        ok = _saveInventory();
-        return;
-      }
+  bool ok = withLockBool(_lock, [&]() -> bool {
+    auto it = std::remove_if(_items.begin(), _items.end(),
+                             [&](const Item& i){ return i.id == id; });
+    if (it != _items.end()) {
+      _items.erase(it, _items.end());
+      return true;
     }
-    ok = false;
+    return false;
   });
+  if (ok) markDirty(EVT_INV_DIRTY);
   return ok;
 }
+
+// ---------------------------------------------------------------------------
+// Dropdown config
+// ---------------------------------------------------------------------------
 
 DropdownConfig InventoryStore::getConfig() {
   DropdownConfig copy;
@@ -134,514 +270,723 @@ DropdownConfig InventoryStore::getConfig() {
 }
 
 bool InventoryStore::setConfig(const DropdownConfig& cfg) {
-  bool ok=false;
-  withLock(_lock, [&](){
+  bool ok = withLockBool(_lock, [&](){
     _cfg = cfg;
-    ok = _saveConfig();
+    return true;
   });
+  if (ok) markDirty(EVT_CFG_DIRTY);
   return ok;
 }
+
+void InventoryStore::flushPending(bool flushInventory, bool flushConfig) {
+  withLock(_lock, [&](){
+    if (flushConfig)  _saveConfig();
+    if (flushInventory) _saveInventory();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-item JSON serializer (reusable for save, export, streaming)
+// Uses a small StaticJsonDocument — safe because it handles one item at a time.
+// ---------------------------------------------------------------------------
+
+void InventoryStore::_writeItemJson(Print& out, const Item& it) {
+  StaticJsonDocument<1024> doc;
+  doc["id"]           = it.id;
+  doc["type"]         = it.type;
+  doc["brand"]        = it.brand;
+  doc["name"]         = it.name;
+  doc["sizeMl"]       = it.sizeMl;
+  if (!isnan(it.abv)) doc["abv"] = it.abv;
+  doc["qty"]          = it.qty;
+  doc["remainingPct"] = it.remainingPct;
+  doc["needToBuy"]    = it.needToBuy;
+  doc["rating"]       = it.rating;
+  JsonArray tags = doc.createNestedArray("tags");
+  for (const auto& t : it.tags) tags.add(t);
+  doc["notes"]        = it.notes;
+  doc["updatedAt"]    = it.updatedAt;
+  doc["version"]      = it.version;
+  serializeJson(doc, out);
+}
+
+// ---------------------------------------------------------------------------
+// Export (string-based, PSRAM-backed)
+// ---------------------------------------------------------------------------
 
 bool InventoryStore::exportAll(String& outJson) {
-  bool ok=false;
-  withLock(_lock, [&](){
-    StaticJsonDocument<8192> doc; // will expand if needed? For larger lists, switch to dynamic doc and stream.
-    doc["app"] = "LibationLocker";
+  return withLockBool(_lock, [&]() -> bool {
+    // Allocate in PSRAM: base overhead + per-item estimate
+    size_t needed = 4096 + _items.size() * EST_BYTES_PER_ITEM;
+    PsramJsonDocument doc(needed);
+
+    doc["app"]     = "LibationLocker";
     doc["version"] = 1;
 
-    // config
-    JsonObject cfg = doc.createNestedObject("config");
-    JsonArray types = cfg.createNestedArray("types");
-    for (auto& t : _cfg.types) types.add(t);
-    JsonArray sizes = cfg.createNestedArray("sizesMl");
-    for (auto& s : _cfg.sizesMl) sizes.add(s);
-    JsonArray abv = cfg.createNestedArray("abvPresets");
-    for (auto& a : _cfg.abvPresets) abv.add(a);
-    JsonArray rem = cfg.createNestedArray("remainingPresets");
-    for (auto& r : _cfg.remainingPresets) rem.add(r);
+    // Config block
+    JsonObject cfgObj = doc.createNestedObject("config");
+    JsonArray types = cfgObj.createNestedArray("types");
+    for (const auto& t : _cfg.types) types.add(t);
+    JsonArray sizes = cfgObj.createNestedArray("sizesMl");
+    for (const auto& s : _cfg.sizesMl) sizes.add(s);
+    JsonArray abv = cfgObj.createNestedArray("abvPresets");
+    for (const auto& a : _cfg.abvPresets) abv.add(a);
+    JsonArray rem = cfgObj.createNestedArray("remainingPresets");
+    for (const auto& r : _cfg.remainingPresets) rem.add(r);
+    JsonObject ai = cfgObj.createNestedObject("ai");
+    ai["enabled"] = _cfg.aiEnabled;
+    ai["baseUrl"] = _cfg.aiBaseUrl;
+    ai["model"] = _cfg.aiModel;
+    ai["apiKey"] = _cfg.aiApiKey;
+    ai["systemPrompt"] = _cfg.aiSystemPrompt;
+    ai["temperature"] = _cfg.aiTemperature;
+    ai["maxTokens"] = _cfg.aiMaxTokens;
+    ai["timeoutSec"] = _cfg.aiTimeoutSec;
+    ai["disableThinking"] = _cfg.aiDisableThinking;
+    ai["streamingEnabled"] = _cfg.aiStreamingEnabled;
+    JsonArray modesArr = ai.createNestedArray("modes");
+    for (const auto& m : _cfg.aiModes) {
+      JsonObject mo = modesArr.createNestedObject();
+      mo["id"] = m.id;
+      mo["label"] = m.label;
+      mo["instruction"] = m.instruction;
+      if (m.systemPrompt.length()) mo["systemPrompt"] = m.systemPrompt;
+      mo["restrictToInventory"] = m.restrictToInventory;
+    }
 
-    // items
-    JsonArray items = doc.createNestedArray("items");
-    for (auto& it : _items) {
-      JsonObject o = items.createNestedObject();
-      o["id"] = it.id;
-      o["type"] = it.type;
-      o["brand"] = it.brand;
-      o["name"] = it.name;
-      o["sizeMl"] = it.sizeMl;
+    // Items array
+    JsonArray itemsArr = doc.createNestedArray("items");
+    for (const auto& it : _items) {
+      JsonObject o = itemsArr.createNestedObject();
+      o["id"]           = it.id;
+      o["type"]         = it.type;
+      o["brand"]        = it.brand;
+      o["name"]         = it.name;
+      o["sizeMl"]       = it.sizeMl;
       if (!isnan(it.abv)) o["abv"] = it.abv;
-      o["qty"] = it.qty;
+      o["qty"]          = it.qty;
       o["remainingPct"] = it.remainingPct;
-      o["needToBuy"] = it.needToBuy;
-      o["rating"] = it.rating;
+      o["needToBuy"]    = it.needToBuy;
+      o["rating"]       = it.rating;
       JsonArray tags = o.createNestedArray("tags");
-      for (auto& tg : it.tags) tags.add(tg);
-      o["notes"] = it.notes;
-      o["updatedAt"] = it.updatedAt;
-      o["version"] = it.version;
+      for (const auto& t : it.tags) tags.add(t);
+      o["notes"]        = it.notes;
+      o["updatedAt"]    = it.updatedAt;
+      o["version"]      = it.version;
     }
 
-    outJson.reserve(8192);
-    outJson = "";
-    serializeJsonPretty(doc, outJson);
-    ok = true;
+    if (doc.overflowed()) {
+      _lastError = "exportAll: JSON buffer overflow";
+      APP_SERIAL.printf("[EXPORT] OVERFLOW — needed %u, capacity %u\n",
+                        doc.memoryUsage(), needed);
+      return false;
+    }
+
+    outJson.clear();
+    serializeJson(doc, outJson);
+    APP_SERIAL.printf("[EXPORT] exportAll completed (%u bytes, %u items)\n",
+                      outJson.length(), _items.size());
+    return true;
   });
-  return ok;
 }
 
-bool InventoryStore::importAll(const String& inJson, const String& mode, bool dryRun, ImportDryRun& dr, String& err) {
-  bool ok=false;
-  err = "";
+// ---------------------------------------------------------------------------
+// Stream-export: writes JSON directly to a Print sink without
+// building the full document in RAM. Each item is serialized through
+// a small 1024-byte StaticJsonDocument and flushed immediately.
+// ---------------------------------------------------------------------------
 
-  withLock(_lock, [&](){
-    DynamicJsonDocument doc(32768);
-    auto de = deserializeJson(doc, inJson);
-    if (de) { err = String("JSON parse error: ") + de.c_str(); ok=false; return; }
+bool InventoryStore::streamExportJson(Print& out) {
+  return withLockBool(_lock, [&]() -> bool {
+    out.print("{\"app\":\"LibationLocker\",\"version\":1,");
 
-    JsonArray itemsIn = doc["items"].as<JsonArray>();
-    if (itemsIn.isNull()) { err = "Missing 'items' array"; ok=false; return; }
-
-    // optional config
-    DropdownConfig cfgIn = _cfg;
-    if (doc.containsKey("config")) {
-      JsonObject c = doc["config"];
-      if (c.containsKey("types")) {
-        cfgIn.types.clear();
-        for (JsonVariant v : c["types"].as<JsonArray>()) cfgIn.types.push_back(v.as<String>());
+    // Config
+    out.print("\"config\":{");
+    {
+      out.print("\"types\":[");
+      for (size_t i = 0; i < _cfg.types.size(); ++i) {
+        if (i) out.print(",");
+        out.print("\""); out.print(_cfg.types[i]); out.print("\"");
       }
-      if (c.containsKey("sizesMl")) {
-        cfgIn.sizesMl.clear();
-        for (JsonVariant v : c["sizesMl"].as<JsonArray>()) cfgIn.sizesMl.push_back(v.as<int>());
+      out.print("],\"sizesMl\":[");
+      for (size_t i = 0; i < _cfg.sizesMl.size(); ++i) {
+        if (i) out.print(",");
+        out.print(_cfg.sizesMl[i]);
       }
-      if (c.containsKey("abvPresets")) {
-        cfgIn.abvPresets.clear();
-        for (JsonVariant v : c["abvPresets"].as<JsonArray>()) cfgIn.abvPresets.push_back(v.as<float>());
+      out.print("],\"abvPresets\":[");
+      for (size_t i = 0; i < _cfg.abvPresets.size(); ++i) {
+        if (i) out.print(",");
+        out.print(_cfg.abvPresets[i], 1);
       }
-      if (c.containsKey("remainingPresets")) {
-        cfgIn.remainingPresets.clear();
-        for (JsonVariant v : c["remainingPresets"].as<JsonArray>()) cfgIn.remainingPresets.push_back(v.as<int>());
+      out.print("],\"remainingPresets\":[");
+      for (size_t i = 0; i < _cfg.remainingPresets.size(); ++i) {
+        if (i) out.print(",");
+        out.print(_cfg.remainingPresets[i]);
       }
+      out.print("]},");
     }
 
-    std::vector<Item> newItems;
-    newItems.reserve(itemsIn.size());
-
-    auto parseItem = [&](JsonObject o, Item& it)->bool {
-      if (!o.containsKey("type") || !o.containsKey("brand") || !o.containsKey("name")) return false;
-      it.id = o["id"] | "";
-      it.type = o["type"].as<String>();
-      it.brand = o["brand"].as<String>();
-      it.name = o["name"].as<String>();
-      it.sizeMl = o["sizeMl"] | 750;
-      if (o.containsKey("abv")) it.abv = o["abv"].as<float>(); else it.abv = NAN;
-      it.qty = o["qty"] | 0;
-      it.remainingPct = o["remainingPct"] | 100;
-      it.needToBuy = o["needToBuy"] | false;
-      it.rating = o["rating"] | 0;
-      it.tags.clear();
-      if (o.containsKey("tags")) {
-        for (JsonVariant v : o["tags"].as<JsonArray>()) it.tags.push_back(v.as<String>());
-      }
-      it.notes = o["notes"] | "";
-      it.updatedAt = o["updatedAt"] | _now();
-      it.version = o["version"] | 1;
-      return true;
-    };
-
-    // dry-run accounting helpers
-    auto findIdxById = [&](const String& id)->int {
-      for (size_t i=0;i<_items.size();++i) if (_items[i].id == id) return (int)i;
-      return -1;
-    };
-
-    if (mode == "replace") {
-      for (JsonVariant v : itemsIn) {
-        Item it;
-        if (!parseItem(v.as<JsonObject>(), it)) continue;
-        if (!it.id.length()) it.id = _genId();
-        dr.addCount++;
-        newItems.push_back(it);
-      }
-      if (!dryRun) {
-        // Apply + persist atomically: if persistence fails, roll back in-memory changes.
-        DropdownConfig oldCfg = _cfg;
-        std::vector<Item> oldItems = _items;
-        _cfg = cfgIn;
-        _items = newItems;
-        ok = _saveConfig() && _saveInventory();
-        if (!ok) {
-          String le = _lastError;
-          _cfg = oldCfg;
-          _items = oldItems;
-          err = le.length() ? le : "save_failed";
-        }
-      } else ok = true;
-      return;
+    // Items — one at a time through _writeItemJson
+    out.print("\"items\":[");
+    for (size_t i = 0; i < _items.size(); ++i) {
+      if (i) out.print(",");
+      _writeItemJson(out, _items[i]);
+      if ((i % 10) == 9) esp_task_wdt_reset();
     }
+    out.print("]}");
 
-    // merge or append
-    std::vector<Item> merged = _items;
-
-    for (JsonVariant v : itemsIn) {
-      Item it;
-      if (!parseItem(v.as<JsonObject>(), it)) continue;
-      if (!it.id.length()) {
-        // append new
-        it.id = _genId();
-        it.version = 1;
-        it.updatedAt = _now();
-        dr.addCount++;
-        merged.push_back(it);
-        continue;
-      }
-
-      int idx = findIdxById(it.id);
-      if (idx < 0) {
-        dr.addCount++;
-        merged.push_back(it);
-      } else {
-        if (mode == "append") {
-          // treat as new
-          it.id = _genId();
-          it.version = 1;
-          it.updatedAt = _now();
-          dr.addCount++;
-          merged.push_back(it);
-        } else {
-          // merge: overwrite existing; increment version
-          dr.updateCount++;
-          it.version = merged[idx].version + 1;
-          it.updatedAt = _now();
-          merged[idx] = it;
-        }
-      }
-    }
-
-    if (!dryRun) {
-      // Apply + persist atomically: if persistence fails, roll back in-memory changes.
-      DropdownConfig oldCfg = _cfg;
-      std::vector<Item> oldItems = _items;
-      _cfg = cfgIn;
-      _items = merged;
-      ok = _saveConfig() && _saveInventory();
-      if (!ok) {
-        String le = _lastError;
-        _cfg = oldCfg;
-        _items = oldItems;
-        err = le.length() ? le : "save_failed";
-      }
-    } else ok = true;
+    APP_SERIAL.printf("[EXPORT] streamExportJson completed (%u items)\n",
+                      _items.size());
+    return true;
   });
-
-  return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem helpers
+// ---------------------------------------------------------------------------
 
 bool InventoryStore::_ensureFs() {
   if (s_fsReady) return true;
-
-  // With the partition label standardized to "spiffs" (subtype littlefs),
-  // we can use the default LittleFS.begin() behavior.
   if (!LittleFS.begin(false)) {
+    APP_SERIAL.println("[FS] Mount failed - format attempt");
     if (!LittleFS.begin(true)) {
-      withLock(_lock, [&](){
-        _lastError =
-          "LittleFS mount failed (begin(false) and begin(true) both failed). "
-          "Confirm your partition scheme includes a data,littlefs partition named 'spiffs' "
-          "and try Tools->Erase Flash: All Flash Contents once.";
-      });
+      _lastError = "LittleFS format+mount failed";
       return false;
     }
   }
-
-  // Ensure base folder exists.
-  if (!LittleFS.exists("/data")) {
-    LittleFS.mkdir("/data");
-  }
-
+  if (!LittleFS.exists("/data")) LittleFS.mkdir("/data");
   s_fsReady = true;
   return true;
 }
 
-
 String InventoryStore::_inventoryPath() { return AppConfig::get().inventoryPath; }
-String InventoryStore::_configPath() { return AppConfig::get().configPath; }
+String InventoryStore::_configPath()    { return AppConfig::get().configPath; }
 
 void InventoryStore::_seedDefaultsIfMissing() {
-  // Ensure FS is mounted and our data directory exists.
-  if (!_ensureFs()) return;
-
-  // Best-effort create data directory
-  if (!LittleFS.exists("/data")) {
-    LittleFS.mkdir("/data");
-  }
-
-  // If files don't exist yet, write defaults so the UI has something to work with
-  if (!LittleFS.exists(_configPath())) {
-    _loadConfig();   // loads defaults into _cfg
-    _saveConfig();   // persists defaults
-  }
-  if (!LittleFS.exists(_inventoryPath())) {
-    withLock(_lock, [&](){ _items.clear(); });
-    _saveInventory();
-  }
-}
-
-bool InventoryStore::_loadInventory() {
-  if (!_ensureFs()) return false;
-
-  const String path = _inventoryPath();
-  if (!LittleFS.exists(path)) {
-    withLock(_lock, [&](){ _items.clear(); });
-    return true;
-  }
-
-  File f = LittleFS.open(path, "r");
-  if (!f) {
-    withLock(_lock, [&](){ _lastError = "open(read) failed: " + path; });
-    return false;
-  }
-
-  // Capacity heuristic: ~2x file size + a little. Cap at 1MB to avoid runaway allocations.
-  size_t cap = (size_t)max((uint32_t)4096, (uint32_t)f.size() * 2U + 2048U);
-  cap = (size_t)min((uint32_t)cap, (uint32_t)(1024U * 1024U));
-
-  DynamicJsonDocument doc(cap);
-  DeserializationError de = deserializeJson(doc, f);
-  f.close();
-
-  if (de) {
-    withLock(_lock, [&](){ _lastError = String("JSON parse error (inventory): ") + de.c_str(); });
-    return false;
-  }
-
-  JsonArray arr;
-  if (doc.is<JsonArray>()) {
-    arr = doc.as<JsonArray>();
-  } else if (doc.containsKey("items")) {
-    arr = doc["items"].as<JsonArray>();
-  }
-
-  if (arr.isNull()) {
-    withLock(_lock, [&](){ _lastError = "Inventory file missing array"; });
-    return false;
-  }
-
-  std::vector<Item> loaded;
-  loaded.reserve(arr.size());
-
-  for (JsonVariant v : arr) {
-    JsonObject o = v.as<JsonObject>();
-    if (o.isNull()) continue;
-
-    Item it;
-    it.id = o["id"] | "";
-    it.type = o["type"] | "";
-    it.brand = o["brand"] | "";
-    it.name = o["name"] | "";
-    it.sizeMl = o["sizeMl"] | 750;
-    if (o.containsKey("abv")) it.abv = o["abv"].as<float>(); else it.abv = NAN;
-    it.qty = o["qty"] | 0;
-    it.remainingPct = o["remainingPct"] | 100;
-    it.needToBuy = o["needToBuy"] | false;
-    it.rating = o["rating"] | 0;
-    it.tags.clear();
-    if (o.containsKey("tags")) {
-      for (JsonVariant tv : o["tags"].as<JsonArray>()) it.tags.push_back(tv.as<String>());
-    }
-    it.notes = o["notes"] | "";
-    it.updatedAt = o["updatedAt"] | 0;
-    it.version = o["version"] | 0;
-
-    if (it.id.length()) loaded.push_back(it);
-  }
-
   withLock(_lock, [&](){
-    _items = loaded;
+    if (_cfg.types.empty()) {
+      _cfg.types = {"Bourbon","Rye","Scotch","Whiskey","Tequila","Vodka","Rum","Gin",
+                    "Liqueur","Amaro","Wine","Mead","Brandy","Beer","Bitters","Absinthe",
+                    "Mixers","Schnapps","Ingredient","Vermouth","NA"};
+    }
+    if (_cfg.sizesMl.empty()) _cfg.sizesMl = {50,100,118,200,355,375,500,700,750,1000,1500,1750};
+    if (_cfg.abvPresets.empty()) _cfg.abvPresets = {5,5.5,6.5,8,9,10,10.5,12.5,12.8,13.5,14,15,16.5,17,20,30,35,40,45,50,55,60};
+    if (_cfg.remainingPresets.empty()) _cfg.remainingPresets = {0,10,25,33,50,66,75,90,100};
   });
-  return true;
 }
 
-bool InventoryStore::_saveInventory() {
-  if (!_ensureFs()) return false;
-
-  const String path = _inventoryPath();
-  const String tmp  = path + ".tmp";
-
-  // Ensure parent dir exists (best-effort)
-  if (!LittleFS.exists("/data")) LittleFS.mkdir("/data");
-
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.createNestedArray("items");
-
-  withLock(_lock, [&](){
-    for (auto& it : _items) {
-      JsonObject o = arr.createNestedObject();
-      o["id"] = it.id;
-      o["type"] = it.type;
-      o["brand"] = it.brand;
-      o["name"] = it.name;
-      o["sizeMl"] = it.sizeMl;
-      if (!isnan(it.abv)) o["abv"] = it.abv;
-      o["qty"] = it.qty;
-      o["remainingPct"] = it.remainingPct;
-      o["needToBuy"] = it.needToBuy;
-      o["rating"] = it.rating;
-      JsonArray tags = o.createNestedArray("tags");
-      for (auto& tg : it.tags) tags.add(tg);
-      o["notes"] = it.notes;
-      o["updatedAt"] = it.updatedAt;
-      o["version"] = it.version;
-    }
-  });
-
-  File f = LittleFS.open(tmp, "w");
-  if (!f) {
-    withLock(_lock, [&](){ _lastError = "open(write) failed: " + tmp; });
-    return false;
-  }
-
-  if (serializeJson(doc, f) == 0) {
-    f.close();
-    withLock(_lock, [&](){ _lastError = "serialize failed: " + tmp; });
-    return false;
-  }
-  f.flush();
-  f.close();
-
-  // Atomic-ish replace
-  if (LittleFS.exists(path)) LittleFS.remove(path);
-  if (!LittleFS.rename(tmp, path)) {
-    // If rename fails, try copy fallback
-    File src = LittleFS.open(tmp, "r");
-    File dst = LittleFS.open(path, "w");
-    if (!src || !dst) {
-      if (src) src.close();
-      if (dst) dst.close();
-      withLock(_lock, [&](){ _lastError = "rename failed and copy fallback failed"; });
-      return false;
-    }
-    uint8_t buf[512];
-    while (true) {
-      int n = src.read(buf, sizeof(buf));
-      if (n <= 0) break;
-      dst.write(buf, (size_t)n);
-    }
-    src.close(); dst.flush(); dst.close();
-    LittleFS.remove(tmp);
-  }
-
-  return true;
-}
+// ---------------------------------------------------------------------------
+// Load config (unchanged logic, same small doc)
+// ---------------------------------------------------------------------------
 
 bool InventoryStore::_loadConfig() {
-  // Defaults first
-  DropdownConfig defaults;
-  defaults.types = {"Bourbon","Rye","Scotch","Whiskey","Tequila","Vodka","Rum","Gin","Liqueur","Amaro","Wine","Beer","Bitters","Mixers","NA"};
-  defaults.sizesMl = {50,200,375,500,700,750,1000,1750};
-  defaults.abvPresets = {20,30,35,40,45,50,55,60};
-  defaults.remainingPresets = {0,10,25,50,75,100};
-
   if (!_ensureFs()) {
-    withLock(_lock, [&](){ _cfg = defaults; });
+    APP_SERIAL.println("[CONFIG] FS unavailable -> defaults");
+    _seedDefaultsIfMissing();
     return false;
   }
 
-  const String path = _configPath();
+  String path = _configPath();
   if (!LittleFS.exists(path)) {
-    withLock(_lock, [&](){ _cfg = defaults; });
+    APP_SERIAL.printf("[CONFIG] %s missing -> seeding & saving defaults\n", path.c_str());
+    _seedDefaultsIfMissing();
+    _saveConfig();
     return true;
   }
 
   File f = LittleFS.open(path, "r");
   if (!f) {
-    withLock(_lock, [&](){ _cfg = defaults; _lastError = "open(read) failed: " + path; });
+    APP_SERIAL.printf("[CONFIG] Cannot open %s\n", path.c_str());
+    _seedDefaultsIfMissing();
     return false;
   }
 
-  size_t cap = (size_t)max((uint32_t)2048, (uint32_t)f.size() * 2U + 1024U);
-  cap = (size_t)min((uint32_t)cap, (uint32_t)(256U * 1024U));
-
-  DynamicJsonDocument doc(cap);
-  DeserializationError de = deserializeJson(doc, f);
+  DynamicJsonDocument doc(16384);
+  DeserializationError err = deserializeJson(doc, f);
   f.close();
 
-  if (de) {
-    withLock(_lock, [&](){ _cfg = defaults; _lastError = String("JSON parse error (config): ") + de.c_str(); });
+  if (err) {
+    APP_SERIAL.printf("[CONFIG] Parse error: %s\n", err.c_str());
+    _seedDefaultsIfMissing();
     return false;
   }
 
-  DropdownConfig loaded = defaults;
+  DropdownConfig loaded;
+  _seedDefaultsIfMissing();
+  bool changed = false;
 
-  if (doc.containsKey("types")) {
+  if (doc["types"].is<JsonArray>()) {
     loaded.types.clear();
-    for (JsonVariant v : doc["types"].as<JsonArray>()) loaded.types.push_back(v.as<String>());
+    for (JsonVariant v : doc["types"].as<JsonArray>()) {
+      String s = v.as<String>();
+      if (s.length()) loaded.types.push_back(s);
+    }
+    APP_SERIAL.printf("[CONFIG] Loaded %u types\n", loaded.types.size());
+    changed = true;
   }
-  if (doc.containsKey("sizesMl")) {
+  if (doc["sizesMl"].is<JsonArray>()) {
     loaded.sizesMl.clear();
     for (JsonVariant v : doc["sizesMl"].as<JsonArray>()) loaded.sizesMl.push_back(v.as<int>());
+    changed = true;
   }
-  if (doc.containsKey("abvPresets")) {
+  if (doc["abvPresets"].is<JsonArray>()) {
     loaded.abvPresets.clear();
     for (JsonVariant v : doc["abvPresets"].as<JsonArray>()) loaded.abvPresets.push_back(v.as<float>());
+    changed = true;
   }
-  if (doc.containsKey("remainingPresets")) {
+  if (doc["remainingPresets"].is<JsonArray>()) {
     loaded.remainingPresets.clear();
     for (JsonVariant v : doc["remainingPresets"].as<JsonArray>()) loaded.remainingPresets.push_back(v.as<int>());
+    changed = true;
   }
 
-  withLock(_lock, [&](){ _cfg = loaded; });
-  return true;
+  JsonObject ai = doc["ai"].as<JsonObject>();
+  if (!ai.isNull()) {
+    loaded.aiEnabled = ai["enabled"] | loaded.aiEnabled;
+    loaded.aiBaseUrl = ai["baseUrl"] | loaded.aiBaseUrl;
+    loaded.aiModel = ai["model"] | loaded.aiModel;
+    loaded.aiApiKey = ai["apiKey"] | loaded.aiApiKey;
+    loaded.aiSystemPrompt = ai["systemPrompt"] | loaded.aiSystemPrompt;
+    loaded.aiTemperature = ai["temperature"] | loaded.aiTemperature;
+    loaded.aiMaxTokens = ai["maxTokens"] | loaded.aiMaxTokens;
+    loaded.aiTimeoutSec = ai["timeoutSec"] | loaded.aiTimeoutSec;
+    loaded.aiDisableThinking = ai["disableThinking"] | loaded.aiDisableThinking;
+    loaded.aiStreamingEnabled = ai["streamingEnabled"] | loaded.aiStreamingEnabled;
+
+    // Load AI modes
+    JsonArrayConst modesArr = ai["modes"].as<JsonArrayConst>();
+    if (!modesArr.isNull()) {
+      loaded.aiModes.clear();
+      for (JsonVariantConst mv : modesArr) {
+        JsonObjectConst mo = mv.as<JsonObjectConst>();
+        if (mo.isNull()) continue;
+        AiMode am;
+        am.id = mo["id"] | "";
+        am.label = mo["label"] | "";
+        am.instruction = mo["instruction"] | "";
+        am.systemPrompt = mo["systemPrompt"] | "";
+        am.restrictToInventory = mo["restrictToInventory"] | true;
+        if (am.id.length() && am.label.length()) loaded.aiModes.push_back(am);
+      }
+    }
+    changed = true;
+  }
+
+  // Seed default modes if none loaded
+  if (loaded.aiModes.empty()) {
+    loaded.aiModes = defaultAiModes();
+    changed = true;
+  }
+
+  if (loaded.aiTemperature < 0.0f) loaded.aiTemperature = 0.0f;
+  if (loaded.aiTemperature > 2.0f) loaded.aiTemperature = 2.0f;
+  if (loaded.aiMaxTokens < 64) loaded.aiMaxTokens = 64;
+  if (loaded.aiMaxTokens > 16384) loaded.aiMaxTokens = 16384;
+  if (loaded.aiTimeoutSec < 30) loaded.aiTimeoutSec = 30;
+  if (loaded.aiTimeoutSec > 600) loaded.aiTimeoutSec = 600;
+
+  if (changed) {
+    withLock(_lock, [&](){ _cfg = loaded; });
+    APP_SERIAL.println("[CONFIG] Applied loaded config");
+  }
+  return changed;
 }
 
 bool InventoryStore::_saveConfig() {
   if (!_ensureFs()) return false;
 
-  const String path = _configPath();
-  const String tmp  = path + ".tmp";
-
-  if (!LittleFS.exists("/data")) LittleFS.mkdir("/data");
-
-  DynamicJsonDocument doc(4096);
-
-  withLock(_lock, [&](){
-    JsonArray types = doc.createNestedArray("types");
-    for (auto& t : _cfg.types) types.add(t);
-
-    JsonArray sizes = doc.createNestedArray("sizesMl");
-    for (auto& s : _cfg.sizesMl) sizes.add(s);
-
-    JsonArray abv = doc.createNestedArray("abvPresets");
-    for (auto& a : _cfg.abvPresets) abv.add(a);
-
-    JsonArray rem = doc.createNestedArray("remainingPresets");
-    for (auto& r : _cfg.remainingPresets) rem.add(r);
-  });
+  String path = _configPath();
+  String tmp = path + ".tmp";
 
   File f = LittleFS.open(tmp, "w");
   if (!f) {
-    withLock(_lock, [&](){ _lastError = "open(write) failed: " + tmp; });
+    APP_SERIAL.println("[CONFIG] Cannot open temp file");
     return false;
   }
+
+  // IMPORTANT: This was previously StaticJsonDocument<16384> which allocated
+  // 16 KB on the STACK. The background save task only has 12 KB of stack,
+  // causing a silent stack overflow that killed the task permanently.
+  // PsramJsonDocument allocates in PSRAM (or heap fallback), keeping the
+  // task stack safe.
+  PsramJsonDocument doc(16384);
+  withLock(_lock, [&](){
+    JsonArray types = doc.createNestedArray("types");
+    for (const auto& t : _cfg.types) types.add(t);
+    JsonArray sizes = doc.createNestedArray("sizesMl");
+    for (const auto& s : _cfg.sizesMl) sizes.add(s);
+    JsonArray abv = doc.createNestedArray("abvPresets");
+    for (const auto& a : _cfg.abvPresets) abv.add(a);
+    JsonArray rem = doc.createNestedArray("remainingPresets");
+    for (const auto& r : _cfg.remainingPresets) rem.add(r);
+    JsonObject ai = doc.createNestedObject("ai");
+    ai["enabled"] = _cfg.aiEnabled;
+    ai["baseUrl"] = _cfg.aiBaseUrl;
+    ai["model"] = _cfg.aiModel;
+    ai["apiKey"] = _cfg.aiApiKey;
+    ai["systemPrompt"] = _cfg.aiSystemPrompt;
+    ai["temperature"] = _cfg.aiTemperature;
+    ai["maxTokens"] = _cfg.aiMaxTokens;
+    ai["timeoutSec"] = _cfg.aiTimeoutSec;
+    ai["disableThinking"] = _cfg.aiDisableThinking;
+    ai["streamingEnabled"] = _cfg.aiStreamingEnabled;
+    JsonArray modesArr = ai.createNestedArray("modes");
+    for (const auto& m : _cfg.aiModes) {
+      JsonObject mo = modesArr.createNestedObject();
+      mo["id"] = m.id;
+      mo["label"] = m.label;
+      mo["instruction"] = m.instruction;
+      if (m.systemPrompt.length()) mo["systemPrompt"] = m.systemPrompt;
+      mo["restrictToInventory"] = m.restrictToInventory;
+    }
+  });
+
   if (serializeJson(doc, f) == 0) {
     f.close();
-    withLock(_lock, [&](){ _lastError = "serialize failed: " + tmp; });
+    LittleFS.remove(tmp);
+    APP_SERIAL.println("[CONFIG] serializeJson failed");
     return false;
   }
+
   f.flush();
   f.close();
 
   if (LittleFS.exists(path)) LittleFS.remove(path);
   if (!LittleFS.rename(tmp, path)) {
-    withLock(_lock, [&](){ _lastError = "rename failed: " + tmp + " -> " + path; });
+    APP_SERIAL.println("[CONFIG] Rename failed");
+    LittleFS.remove(tmp);
     return false;
   }
 
+  APP_SERIAL.println("[CONFIG] Saved");
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// _loadInventory() — PSRAM-backed, buffer sized to actual file
+// ---------------------------------------------------------------------------
+
+bool InventoryStore::_loadInventory() {
+  String path = _inventoryPath();
+  if (!LittleFS.exists(path)) {
+    APP_SERIAL.printf("[INV] No inventory file %s\n", path.c_str());
+    return true;
+  }
+
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  // Size the JSON buffer to the file: ArduinoJson needs roughly 2x the
+  // raw JSON size for its DOM (keys stored as pointers into the input,
+  // plus node overhead). Multiply by 2.5 for safety, minimum 8KB.
+  size_t fileSize = f.size();
+  size_t docSize = max((size_t)8192, (size_t)(fileSize * 2.5));
+
+  APP_SERIAL.printf("[INV] Loading inventory: file=%u bytes, docBuffer=%u bytes (PSRAM)\n",
+                    fileSize, docSize);
+
+  PsramJsonDocument doc(docSize);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+
+  if (err) {
+    _lastError = String("Inventory parse: ") + err.c_str();
+    APP_SERIAL.printf("[INV] Inventory parse error: %s (file=%u, buf=%u)\n",
+                      err.c_str(), fileSize, docSize);
+    return false;
+  }
+
+  JsonArray arr = doc["items"].as<JsonArray>();
+  ItemVector loaded;
+  loaded.reserve(arr.size() + 20);  // extra capacity avoids realloc on first adds
+
+  for (JsonVariant v : arr) {
+    JsonObject o = v.as<JsonObject>();
+    Item it;
+    it.id           = o["id"] | "";
+    it.type         = o["type"] | "";
+    it.brand        = o["brand"] | "";
+    it.name         = o["name"] | "";
+    it.sizeMl       = o["sizeMl"] | 750;
+    it.abv          = o.containsKey("abv") ? o["abv"].as<float>() : NAN;
+    it.qty          = o["qty"] | 0;
+    it.remainingPct = o["remainingPct"] | 100;
+    it.needToBuy    = o["needToBuy"] | false;
+    it.rating       = o["rating"] | 0;
+    it.notes        = o["notes"] | "";
+    it.updatedAt    = o["updatedAt"] | 0;
+    it.version      = o["version"] | 1;
+
+    if (o.containsKey("tags")) {
+      for (JsonVariant t : o["tags"].as<JsonArray>()) it.tags.push_back(t.as<String>());
+    }
+
+    if (!it.id.isEmpty()) loaded.push_back(it);
+  }
+
+  withLock(_lock, [&](){ _items = std::move(loaded); });
+  APP_SERIAL.printf("[INV] Parsed %u items from disk\n", _items.size());
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// _saveInventory() — STREAMING: writes item-by-item to file.
+// No giant JSON document in RAM. Each item uses a 1024-byte StaticJsonDocument
+// that is reused for every item. Total RAM cost is constant regardless of
+// item count.
+// ---------------------------------------------------------------------------
+
+bool InventoryStore::_saveInventory() {
+  if (!_ensureFs()) return false;
+
+  String path = _inventoryPath();
+  String tmp = path + ".tmp";
+
+  File f = LittleFS.open(tmp, "w");
+  if (!f) {
+    _lastError = "Cannot open temp file for inventory save";
+    APP_SERIAL.println("[INV] Cannot open temp file");
+    return false;
+  }
+
+  // Write the wrapping structure and items one at a time
+  f.print("{\"items\":[");
+
+  for (size_t i = 0; i < _items.size(); ++i) {
+    if (i > 0) f.print(",");
+    _writeItemJson(f, _items[i]);
+    // Feed watchdog every 10 items — LittleFS writes can be slow
+    if ((i % 10) == 9) esp_task_wdt_reset();
+  }
+
+  f.print("]}");
+  f.flush();
+
+  // Verify something was written
+  size_t written = f.size();
+  f.close();
+
+  if (written < 12) { // minimum valid: {"items":[]}
+    _lastError = "Inventory save wrote 0 bytes";
+    LittleFS.remove(tmp);
+    APP_SERIAL.println("[INV] Save wrote nothing — aborting");
+    return false;
+  }
+
+  if (LittleFS.exists(path)) LittleFS.remove(path);
+  if (!LittleFS.rename(tmp, path)) {
+    _lastError = "Inventory rename failed";
+    LittleFS.remove(tmp);
+    APP_SERIAL.println("[INV] Rename failed");
+    return false;
+  }
+
+  APP_SERIAL.printf("[INV] Saved %u items (%u bytes)\n", _items.size(), written);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// importAll() — PSRAM-backed parsing
+// ---------------------------------------------------------------------------
+
+bool InventoryStore::importAll(const String& inJson,
+                               const String& mode,
+                               bool dryRun,
+                               ImportDryRun& dr,
+                               String& err) {
+  // Size the document to the input. ArduinoJson needs ~2x for DOM overhead.
+  size_t docSize = max((size_t)8192, (size_t)(inJson.length() * 2.5));
+  APP_SERIAL.printf("[IMPORT] Parsing %u bytes, docBuffer=%u (PSRAM)\n",
+                    inJson.length(), docSize);
+
+  PsramJsonDocument doc(docSize);
+  DeserializationError parseErr = deserializeJson(doc, inJson);
+  if (parseErr) {
+    err = String("JSON parse error: ") + parseErr.c_str();
+    APP_SERIAL.printf("[IMPORT] Parse failed: %s\n", parseErr.c_str());
+    return false;
+  }
+
+  if (doc.overflowed()) {
+    err = "JSON too large for available memory";
+    APP_SERIAL.printf("[IMPORT] Doc overflowed at %u bytes\n", docSize);
+    return false;
+  }
+
+  // --- Load config from bundle (if present) ---
+  if (!dryRun && doc.containsKey("config")) {
+    JsonObject cfgObj = doc["config"].as<JsonObject>();
+    DropdownConfig imported;
+
+    if (cfgObj["types"].is<JsonArray>()) {
+      for (JsonVariant v : cfgObj["types"].as<JsonArray>()) {
+        String s = v.as<String>();
+        if (s.length()) imported.types.push_back(s);
+      }
+    }
+    if (cfgObj["sizesMl"].is<JsonArray>()) {
+      for (JsonVariant v : cfgObj["sizesMl"].as<JsonArray>())
+        imported.sizesMl.push_back(v.as<int>());
+    }
+    if (cfgObj["abvPresets"].is<JsonArray>()) {
+      for (JsonVariant v : cfgObj["abvPresets"].as<JsonArray>())
+        imported.abvPresets.push_back(v.as<float>());
+    }
+    if (cfgObj["remainingPresets"].is<JsonArray>()) {
+      for (JsonVariant v : cfgObj["remainingPresets"].as<JsonArray>())
+        imported.remainingPresets.push_back(v.as<int>());
+    }
+    JsonObject ai = cfgObj["ai"].as<JsonObject>();
+    if (!ai.isNull()) {
+      imported.aiEnabled = ai["enabled"] | imported.aiEnabled;
+      imported.aiBaseUrl = ai["baseUrl"] | imported.aiBaseUrl;
+      imported.aiModel = ai["model"] | imported.aiModel;
+      imported.aiApiKey = ai["apiKey"] | imported.aiApiKey;
+      imported.aiSystemPrompt = ai["systemPrompt"] | imported.aiSystemPrompt;
+      imported.aiTemperature = ai["temperature"] | imported.aiTemperature;
+      imported.aiMaxTokens = ai["maxTokens"] | imported.aiMaxTokens;
+      imported.aiTimeoutSec = ai["timeoutSec"] | imported.aiTimeoutSec;
+      imported.aiDisableThinking = ai["disableThinking"] | imported.aiDisableThinking;
+      imported.aiStreamingEnabled = ai["streamingEnabled"] | imported.aiStreamingEnabled;
+      JsonArrayConst modesArr = ai["modes"].as<JsonArrayConst>();
+      if (!modesArr.isNull()) {
+        imported.aiModes.clear();
+        for (JsonVariantConst mv : modesArr) {
+          JsonObjectConst mo = mv.as<JsonObjectConst>();
+          if (mo.isNull()) continue;
+          AiMode am;
+          am.id = mo["id"] | "";
+          am.label = mo["label"] | "";
+          am.instruction = mo["instruction"] | "";
+          am.systemPrompt = mo["systemPrompt"] | "";
+          am.restrictToInventory = mo["restrictToInventory"] | true;
+          if (am.id.length() && am.label.length()) imported.aiModes.push_back(am);
+        }
+      }
+    }
+
+    if (!imported.types.empty() || !imported.sizesMl.empty() ||
+        !imported.abvPresets.empty() || !imported.remainingPresets.empty() ||
+        imported.aiBaseUrl.length() || imported.aiModel.length() || imported.aiSystemPrompt.length() || imported.aiApiKey.length() || imported.aiEnabled) {
+      setConfig(imported);
+    }
+  }
+
+  // --- Load items ---
+  if (!doc.containsKey("items") || !doc["items"].is<JsonArray>()) {
+    err = "Missing or invalid 'items' array";
+    return false;
+  }
+
+  JsonArray arr = doc["items"].as<JsonArray>();
+  dr = ImportDryRun{};
+
+  return withLockBool(_lock, [&]() -> bool {
+
+    // "replace" mode: wipe existing inventory
+    if (mode == "replace") {
+      if (!dryRun) _items.clear();
+      for (JsonVariant v : arr) {
+        JsonObject o = v.as<JsonObject>();
+        Item it;
+        it.id           = o["id"].as<String>();
+        it.type         = o["type"] | "";
+        it.brand        = o["brand"] | "";
+        it.name         = o["name"] | "";
+        it.sizeMl       = o["sizeMl"] | 750;
+        it.abv          = o.containsKey("abv") ? o["abv"].as<float>() : NAN;
+        it.qty          = o["qty"] | 0;
+        it.remainingPct = o["remainingPct"] | 100;
+        it.needToBuy    = o["needToBuy"] | false;
+        it.rating       = o["rating"] | 0;
+        it.notes        = o["notes"] | "";
+        it.updatedAt    = o["updatedAt"] | _now();
+        it.version      = o["version"] | 1;
+
+        if (o.containsKey("tags")) {
+          for (JsonVariant t : o["tags"].as<JsonArray>())
+            it.tags.push_back(t.as<String>());
+        }
+
+        if (it.id.isEmpty()) it.id = _genId();
+        dr.addCount++;
+        if (!dryRun) _items.push_back(it);
+      }
+    }
+
+    // "merge" or "append"
+    else {
+      for (JsonVariant v : arr) {
+        JsonObject o = v.as<JsonObject>();
+        String inId = o["id"].as<String>();
+
+        Item it;
+        it.type         = o["type"] | "";
+        it.brand        = o["brand"] | "";
+        it.name         = o["name"] | "";
+        it.sizeMl       = o["sizeMl"] | 750;
+        it.abv          = o.containsKey("abv") ? o["abv"].as<float>() : NAN;
+        it.qty          = o["qty"] | 0;
+        it.remainingPct = o["remainingPct"] | 100;
+        it.needToBuy    = o["needToBuy"] | false;
+        it.rating       = o["rating"] | 0;
+        it.notes        = o["notes"] | "";
+        it.updatedAt    = o["updatedAt"] | _now();
+        it.version      = o["version"] | 1;
+
+        if (o.containsKey("tags")) {
+          for (JsonVariant t : o["tags"].as<JsonArray>())
+            it.tags.push_back(t.as<String>());
+        }
+
+        // Try to find existing item by id (merge only)
+        bool found = false;
+        if (mode == "merge" && !inId.isEmpty()) {
+          for (auto& existing : _items) {
+            if (existing.id == inId) {
+              found = true;
+              if (it.version != 0 && it.version != existing.version) {
+                dr.conflictCount++;
+              } else {
+                dr.updateCount++;
+                if (!dryRun) {
+                  it.id = inId;
+                  it.version = existing.version + 1;
+                  it.updatedAt = _now();
+                  existing = it;
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        if (!found) {
+          dr.addCount++;
+          if (!dryRun) {
+            it.id = (mode == "append" || inId.isEmpty()) ? _genId() : inId;
+            it.updatedAt = _now();
+            _items.push_back(it);
+          }
+        }
+      }
+    }
+
+    if (!dryRun) {
+      markDirty(EVT_INV_DIRTY);
+      APP_SERIAL.printf("[IMPORT] mode=%s add=%d update=%d conflict=%d\n",
+                        mode.c_str(), dr.addCount, dr.updateCount, dr.conflictCount);
+    }
+
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
 String InventoryStore::_genId() {
-  // short pseudo-uuid: 8 hex chars + millis low
   uint32_t r = esp_random();
   char buf[16];
   snprintf(buf, sizeof(buf), "%08lx", (unsigned long)r);
@@ -649,6 +994,10 @@ String InventoryStore::_genId() {
 }
 
 uint32_t InventoryStore::_now() {
-  // If time isn't synced, returns millis()/1000. Good enough for personal use.
+  // Use real UTC epoch when NTP is synced (requires STA connection).
+  // Falls back to millis-based uptime so items still get timestamps
+  // even in AP-only mode.
+  uint32_t epoch = AppWiFi::epochNow();
+  if (epoch > 0) return epoch;
   return (uint32_t)(millis() / 1000UL);
 }

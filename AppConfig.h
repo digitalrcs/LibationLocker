@@ -15,9 +15,15 @@
 
 struct RuntimeConfig {
   String apSsid = "LibationLocker";
-  String apPass = ""; // blank=open AP (personal use)
-
-  // data paths (unused when persistence disabled)
+  // IMPORTANT: For safety when sharing the device, do NOT leave this blank.
+  // If blank at boot, AppConfig::begin() will use the compiled-in default.
+  String apPass = "adminadmin";
+// HTTP Basic Auth for UI + API.
+  // If webUser is blank, auth is disabled. Default is admin/admin.
+  // If webUser is set, requests must include valid Basic Auth credentials.
+  String webUser = "admin";
+  String webPass = "admin";
+// data paths (unused when persistence disabled)
   String inventoryPath = "/data/inventory.json";
   String configPath    = "/data/config.json";
 };

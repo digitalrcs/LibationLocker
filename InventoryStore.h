@@ -13,7 +13,17 @@
 #pragma once
 #include <Arduino.h>
 #include <vector>
+#include <functional>
 #include "Models.h"
+#include "PsramAllocator.h"
+
+// Forward-declare Print so callers don't need to include it
+class Print;
+
+// The inventory vector's backing array lives in PSRAM to keep
+// ~10-15 KB off the internal heap. Individual Item String buffers
+// still allocate on internal heap (Arduino String uses malloc).
+using ItemVector = std::vector<Item, PsramStdAllocator<Item>>;
 
 struct ImportDryRun {
   int addCount = 0;
@@ -25,18 +35,29 @@ class InventoryStore {
 public:
   static void begin();
 
-  // last persistence error (best-effort; primarily for HTTP error reporting)
   static String lastError();
 
-  // CRUD
-  static std::vector<Item> getAll(); // copy (safe)
+  // ---- Read access (thread-safe) ----
+
+  // Returns a standard-allocator copy (internal heap) for callers that
+  // need an independent snapshot. Prefer forEach() for iteration to
+  // avoid the copy overhead.
+  static std::vector<Item> getAll();
+
+  // Item count without copying the vector
+  static size_t count();
+
+  // Iterate items under lock. Callback receives a const reference.
+  // Return false from the callback to stop early.
+  static void forEach(std::function<bool(const Item&)> cb);
+
   static bool getById(const String& id, Item& out);
+
+  // ---- Write access ----
 
   static bool create(const Item& in, Item& outCreated);
 
-  // update with optimistic concurrency:
-  // - versionConflict=true when 'in.version' doesn't match current item version
-  // - 'current' is filled with current stored item when conflict occurs
+  // Update with optimistic concurrency
   static bool update(const String& id,
                      const Item& in,
                      Item& outUpdated,
@@ -45,17 +66,31 @@ public:
 
   static bool remove(const String& id);
 
-  // dropdown config
+  // ---- Dropdown config ----
+
   static DropdownConfig getConfig(); // copy
   static bool setConfig(const DropdownConfig& cfg);
 
-  // import/export bundle (config + items)
+  // ---- Import / Export ----
+
+  // Export full bundle (config + items) as JSON string (PSRAM-backed)
   static bool exportAll(String& outJson);
+
+  // Stream-export: writes JSON directly to a Print sink (AsyncResponseStream, File, etc.)
+  // Avoids building the full JSON string in RAM.
+  static bool streamExportJson(Print& out);
+
   static bool importAll(const String& inJson,
-                        const String& mode,   // "replace" | "merge" (default) | "append"
+                        const String& mode,   // "replace" | "merge" | "append"
                         bool dryRun,
                         ImportDryRun& dr,
                         String& err);
+
+  // Force flush pending saves
+  static void flushPending(bool flushInventory, bool flushConfig);
+
+  // Background saver task (public so xTaskCreate can reference it)
+  static void inventorySaveTask(void* arg);
 
 private:
   static String _inventoryPath();
@@ -72,8 +107,11 @@ private:
   static String _genId();
   static uint32_t _now();
 
-  // in-memory state
-  static std::vector<Item> _items;
+  // Serialize one Item into a small JSON doc and write to a Print sink
+  static void _writeItemJson(Print& out, const Item& it);
+
+  // in-memory state (backing array in PSRAM)
+  static ItemVector _items;
   static DropdownConfig _cfg;
 
   // diagnostics
